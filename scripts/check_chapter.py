@@ -156,17 +156,7 @@ def save_state(chapter: dict) -> None:
         f.write("\n")
 
 
-def send_discord_notification(chapter: dict, webhook_url: str) -> None:
-    embed = {
-        "title": chapter["title"],
-        "url": chapter["url"],
-        "description": "A new One Piece chapter is out.",
-        "color": DISCORD_COLOR_NEW_CHAPTER,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer": {"text": "weebcentral"},
-    }
-    payload = {"embeds": [embed]}
-
+def _post_to_discord_webhook(webhook_url: str, payload: dict) -> None:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         webhook_url,
@@ -175,16 +165,67 @@ def send_discord_notification(chapter: dict, webhook_url: str) -> None:
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            # Discord webhooks return 204 No Content on success.
-            if resp.status not in (200, 204):
-                raise ScraperError(f"Discord webhook returned unexpected status {resp.status}")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise ScraperError(f"Discord webhook HTTP error {e.code}: {body}") from e
-    except urllib.error.URLError as e:
-        raise ScraperError(f"Network error sending Discord notification: {e.reason}") from e
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        # Discord webhooks return 204 No Content on success.
+        if resp.status not in (200, 204):
+            raise ScraperError(f"Discord webhook returned unexpected status {resp.status}")
+
+
+def send_discord_notifications(chapter: dict, webhook_urls: list[str]) -> None:
+    """
+    Post the same new-chapter embed to every URL in webhook_urls.
+
+    Tries all of them even if one fails, then raises a single ScraperError
+    summarizing any failures (with the webhook URL masked). Callers should
+    treat any failure here the same as before: don't save state, so the
+    next run retries every webhook (a channel that already got a message
+    may see a rare duplicate, but no channel silently misses a chapter).
+    """
+    errors: list[str] = []
+
+    for webhook_url in webhook_urls:
+        embed = {
+            "title": chapter["title"],
+            "url": chapter["url"],
+            "description": "A new One Piece chapter is out.",
+            "color": DISCORD_COLOR_NEW_CHAPTER,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "footer": {"text": "weebcentral"},
+        }
+        payload = {"embeds": [embed]}
+
+        # Mask the webhook in logs -- it's a bearer credential.
+        masked = webhook_url[:40] + "..." if len(webhook_url) > 40 else webhook_url
+
+        try:
+            _post_to_discord_webhook(webhook_url, payload)
+            log_ok(f"Notified Discord webhook ({masked}).")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            errors.append(f"{masked}: HTTP error {e.code}: {body}")
+        except urllib.error.URLError as e:
+            errors.append(f"{masked}: network error: {e.reason}")
+        except ScraperError as e:
+            errors.append(f"{masked}: {e}")
+
+    if errors:
+        raise ScraperError(
+            f"{len(errors)}/{len(webhook_urls)} Discord webhook(s) failed: " + " | ".join(errors)
+        )
+
+
+def get_webhook_urls() -> list[str]:
+    """
+    Collect every configured Discord webhook URL.
+
+    Add more by adding more env vars here (and as secrets/steps in the
+    workflow) -- DISCORD_WEBHOOK_URL_3, _4, etc.
+    """
+    candidates = [
+        os.environ.get("DISCORD_WEBHOOK_URL"),
+        os.environ.get("DISCORD_WEBHOOK_URL_2"),
+    ]
+    return [url for url in candidates if url]
 
 
 # --- CLI / main -----------------------------------------------------------
@@ -243,13 +284,13 @@ def main() -> int:
         log_ok(f"No new chapter (still {latest['chapter_number']}). No action taken.")
         return 0
 
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not webhook_url:
-        log_error("DISCORD_WEBHOOK_URL environment variable is not set.")
+    webhook_urls = get_webhook_urls()
+    if not webhook_urls:
+        log_error("No Discord webhook URLs configured (DISCORD_WEBHOOK_URL / DISCORD_WEBHOOK_URL_2).")
         return 1
 
     try:
-        send_discord_notification(latest, webhook_url)
+        send_discord_notifications(latest, webhook_urls)
     except ScraperError as e:
         log_error(f"Failed to send Discord notification: {e}")
         return 1

@@ -31,6 +31,7 @@ jobs:
         id: check
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL_2: ${{ secrets.DISCORD_WEBHOOK_URL_2 }}
         run: python3 scripts/check_chapter.py
 
       - name: Commit and push updated state (if changed)

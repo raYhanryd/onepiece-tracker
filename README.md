@@ -48,7 +48,7 @@ git push -u origin main
 
 (Or create the private repo on github.com first, then `git remote add origin <url>` and push.)
 
-### 2. Add the Discord webhook secret
+### 2. Add the Discord webhook secret(s)
 
 1. In Discord: Server Settings → Integrations → Webhooks → New Webhook.
    Pick the channel you want notifications in, copy the webhook URL.
@@ -59,6 +59,20 @@ git push -u origin main
 
 The script reads this from the environment — it's never hardcoded
 anywhere in the repo.
+
+**Sending to a second server/channel too:** repeat step 1 in the other
+Discord server to get a second webhook URL, then add it as a second
+repo secret named `DISCORD_WEBHOOK_URL_2`. The workflow already passes
+it through, and the script sends the same notification to every
+configured webhook. To add a third, fourth, etc., extend the
+`candidates` list in `get_webhook_urls()` in `scripts/check_chapter.py`
+and add a matching secret + env line in
+`.github/workflows/check-chapter.yml`.
+
+If any one webhook fails to send, the run fails loudly (same as
+before) and the state file isn't updated, so the next run retries
+*all* webhooks — a channel that already got the message may see a
+rare duplicate, but no channel will silently miss a chapter.
 
 ### 3. Permissions for `GITHUB_TOKEN`
 
