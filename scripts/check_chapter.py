@@ -310,6 +310,9 @@ def reconcile_quarantine(quarantined: dict, targets: list[tuple[str, str]]) -> d
 
 
 def build_new_chapter_payload(chapter: dict) -> dict:
+    # Keep this shape deliberately minimal: title, link, one-line description,
+    # colour. The publish date stays in state (see fetch_latest_chapter) but is
+    # not shown in the embed.
     embed = {
         "title": chapter.get("title") or f"One Piece Chapter {chapter.get('chapter_number')}",
         "url": chapter.get("url", ""),
@@ -318,12 +321,6 @@ def build_new_chapter_payload(chapter: dict) -> dict:
         "timestamp": _utc_now_iso(),
         "footer": {"text": "weebcentral"},
     }
-    if chapter.get("pub_date"):
-        # Also log the original publish date, so a late retry for an older
-        # chapter doesn't look like a brand-new release.
-        embed["fields"] = [
-            {"name": "Published", "value": str(chapter["pub_date"])[:1024], "inline": True}
-        ]
     return {"embeds": [embed]}
 
 

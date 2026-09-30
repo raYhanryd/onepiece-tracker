@@ -93,6 +93,32 @@ class ClassifyAndPendingTests(unittest.TestCase):
         )
 
 
+class NotificationPayloadTests(unittest.TestCase):
+    def test_new_chapter_embed_matches_the_original_shape(self):
+        chapter = {
+            "chapter_number": 1194,
+            "title": "One Piece Chapter 1194",
+            "url": "https://weebcentral.com/chapters/new",
+            "pub_date": "Sat, 26 Sep 2026 03:16:36 +0000",
+        }
+        embed = check_chapter.build_new_chapter_payload(chapter)["embeds"][0]
+        self.assertEqual(sorted(embed), ["color", "description", "footer", "timestamp", "title", "url"])
+        self.assertNotIn("fields", embed)
+        self.assertEqual(embed["title"], "One Piece Chapter 1194")
+        self.assertEqual(embed["url"], "https://weebcentral.com/chapters/new")
+
+    def test_publish_date_never_leaks_into_the_embed(self):
+        chapter = {
+            "chapter_number": 1194,
+            "title": "One Piece Chapter 1194",
+            "url": "https://weebcentral.com/chapters/new",
+            "pub_date": "Sat, 26 Sep 2026 03:16:36 +0000",
+        }
+        embed = check_chapter.build_new_chapter_payload(chapter)["embeds"][0]
+        self.assertNotIn("Published", json.dumps(embed))
+        self.assertNotIn("26 Sep 2026", json.dumps(embed))
+
+
 class ReconcileQuarantineTests(unittest.TestCase):
     def test_keeps_matching_entry(self):
         entry = {"fingerprint": check_chapter.webhook_fingerprint(URL_A), "reason": "404"}
