@@ -13,6 +13,9 @@ no server, no paid hosting. Same pattern as `email-digest-gemini`.
   `state/last_chapter.json`.
 - If it's new: sends a Discord embed notification to every configured
   webhook, then updates and commits the state file back to the repo.
+  Alerts sent to the second webhook also ping that server's role, whose ID
+  comes from the repo variable `DISCORD_ROLE_ID_2`; the first webhook's
+  message is unchanged and pings nobody.
 - If it's not new: does nothing (after retrying any delivery that failed
   on an earlier run).
 - The state file records *which* webhooks already received the current
@@ -78,6 +81,21 @@ it through, and the script sends the same notification to every
 simply doesn't exist. To add a third, fourth, etc., extend the
 `WEBHOOK_ENV_VARS` tuple in `scripts/check_chapter.py` and add a matching
 secret + env line in `.github/workflows/check-chapter.yml`.
+
+**Role ping on the second webhook:** alerts delivered to
+`DISCORD_WEBHOOK_URL_2` mention the role in the repository variable
+`DISCORD_ROLE_ID_2` (value `1568322226804232304`), with an explicit
+`allowed_mentions` entry so Discord actually pushes the ping. Alerts to
+`DISCORD_WEBHOOK_URL` do not mention anyone.
+
+Create the variable here: repo → Settings → Secrets and variables →
+Actions → **Variables** tab → New repository variable. Name:
+`DISCORD_ROLE_ID_2`, value: `1568322226804232304`. It is an ID, not a
+credential, so a variable (not a secret) is the right place. If it is
+unset, webhook 2 still gets the alert — just without a ping. To change
+the role later, edit the variable; no code change needed. If the mention
+shows up but nobody is notified, make the role mentionable
+(Role settings → Display → Allow anyone to @mention this role).
 
 Per-destination delivery tracking means a failure on one webhook never
 re-notifies the others, and a permanently dead webhook gets quarantined
@@ -157,7 +175,23 @@ This GETs each configured webhook and reports OK or DEAD (`HTTP 404`
 usually means the webhook was deleted or its channel is gone). No
 messages are sent and the state file is not touched.
 
-**6. Run the unit tests:**
+**6. Send a test notification:**
+
+```bash
+export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+export DISCORD_WEBHOOK_URL_2="https://discord.com/api/webhooks/..."
+export DISCORD_ROLE_ID_2="1568322226804232304"  # same value as the repo variable
+python3 scripts/check_chapter.py --send-test
+```
+
+Delivers a clearly marked `[TEST]` alert through the real delivery path
+to every configured webhook — including webhook 2's role ping — without
+fetching the feed or touching `state/last_chapter.json`. Exit code is
+non-zero if any destination fails. The same thing runs from GitHub
+Actions with the `send-test` dispatch mode (see below), which is the
+easiest way to test the real secrets.
+
+**7. Run the unit tests:**
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -178,6 +212,9 @@ repo → Actions → "Check for new One Piece chapter" → Run workflow. The
 - `check-webhooks` — GET each configured webhook without sending a
   message; reports OK or DEAD per secret. Use this after rotating a
   webhook URL, or when you suspect one is broken.
+- `send-test` — send a marked `[TEST]` alert (role ping included) to
+  every configured webhook. Sends nothing to state, so the next real
+  check still behaves normally.
 
 Good for confirming the scheduled workflow is wired up correctly before
 waiting for the next cron tick.

@@ -19,6 +19,7 @@ on:
           - check
           - dry-run
           - check-webhooks
+          - send-test
         default: check
 
 permissions:
@@ -54,10 +55,14 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_WEBHOOK_URL_2: ${{ secrets.DISCORD_WEBHOOK_URL_2 }}
+          # Repo variable: Settings -> Secrets and variables -> Actions -> Variables.
+          # Empty/unset just means no role ping on webhook 2.
+          DISCORD_ROLE_ID_2: ${{ vars.DISCORD_ROLE_ID_2 }}
         run: |
           case "${{ github.event.inputs.mode || 'check' }}" in
             dry-run) python3 scripts/check_chapter.py --dry-run ;;
             check-webhooks) python3 scripts/check_chapter.py --check-webhooks ;;
+            send-test) python3 scripts/check_chapter.py --send-test ;;
             *) python3 scripts/check_chapter.py ;;
           esac
 

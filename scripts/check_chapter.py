@@ -28,6 +28,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -44,6 +45,14 @@ STATE_PATH = os.path.join(os.path.dirname(__file__), "..", "state", "last_chapte
 # workflow) -- DISCORD_WEBHOOK_URL_3, _4, etc. Variables that are unset
 # are simply skipped, so one configured webhook means one destination.
 WEBHOOK_ENV_VARS = ("DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_URL_2")
+
+# Optional per-webhook role pings, configured outside the code: each entry
+# maps a webhook env var to the env var holding its Discord role ID. In
+# GitHub Actions that is a repo *variable* (not a secret -- role IDs are not
+# sensitive). Unset = that webhook's alerts carry no ping.
+WEBHOOK_ROLE_ENV_VARS = {
+    "DISCORD_WEBHOOK_URL_2": "DISCORD_ROLE_ID_2",
+}
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -140,6 +149,27 @@ def is_valid_discord_webhook(url: str) -> bool:
 def mask_webhook(url: str) -> str:
     """Mask a webhook for logs -- it's a bearer credential."""
     return url[:40] + "..." if len(url) > 40 else url
+
+
+def get_webhook_role_id(key: str) -> str | None:
+    """
+    Resolve the optional role ping for one webhook from its env var.
+
+    Accepts a bare snowflake or a "<@&123...>" mention; anything else is
+    ignored so a typo cannot produce a malformed message.
+    """
+    env_var = WEBHOOK_ROLE_ENV_VARS.get(key)
+    if not env_var:
+        return None
+    raw = (os.environ.get(env_var) or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("<@&") and raw.endswith(">"):
+        raw = raw[3:-1]
+    if not raw.isdigit():
+        log_warn(f"{env_var} is not a numeric Discord role ID; skipping that ping.")
+        return None
+    return raw
 
 
 def get_webhook_targets() -> list[tuple[str, str]]:
@@ -309,19 +339,35 @@ def reconcile_quarantine(quarantined: dict, targets: list[tuple[str, str]]) -> d
     return reconciled
 
 
-def build_new_chapter_payload(chapter: dict) -> dict:
+def build_new_chapter_payload(
+    chapter: dict, role_id: str | None = None, test: bool = False
+) -> dict:
     # Keep this shape deliberately minimal: title, link, one-line description,
     # colour. The publish date stays in state (see fetch_latest_chapter) but is
     # not shown in the embed.
+    title = chapter.get("title") or f"One Piece Chapter {chapter.get('chapter_number')}"
+    description = "A new One Piece chapter is out."
+    if test:
+        title = f"[TEST] {title}"
+        description = (
+            "Test notification from the chapter tracker -- this is not a new "
+            "chapter. If this pinged the configured role, the mention works."
+        )
     embed = {
-        "title": chapter.get("title") or f"One Piece Chapter {chapter.get('chapter_number')}",
+        "title": title,
         "url": chapter.get("url", ""),
-        "description": "A new One Piece chapter is out.",
+        "description": description,
         "color": DISCORD_COLOR_NEW_CHAPTER,
         "timestamp": _utc_now_iso(),
         "footer": {"text": "weebcentral"},
     }
-    return {"embeds": [embed]}
+    payload: dict = {"embeds": [embed]}
+    if role_id:
+        payload["content"] = f"<@&{role_id}>"
+        # parse: [] keeps @everyone/@here/user mentions off; roles lets the
+        # one role we do want through.
+        payload["allowed_mentions"] = {"parse": [], "roles": [role_id]}
+    return payload
 
 
 def build_quarantine_alert_payload(key: str, reason: str) -> dict:
@@ -408,11 +454,15 @@ def _attempt_webhook(key: str, url: str, payload: dict) -> DeliveryOutcome:
 
 def attempt_deliveries(
     targets: list[tuple[str, str]],
-    payload: dict,
+    payload: dict | Callable[[str], dict],
     attempt=None,
 ) -> list[DeliveryOutcome]:
     """
-    Deliver the payload to every target, collecting outcomes.
+    Deliver to every target, collecting outcomes.
+
+    `payload` is either a ready dict (identical message everywhere) or a
+    callable mapping the webhook's env-var name to its payload -- the second
+    webhook gets an extra role ping, so its message differs.
 
     `attempt` is a seam for tests (defaults to the real webhook poster).
     Malformed URLs are reported as permanent failures without any network
@@ -435,7 +485,8 @@ def attempt_deliveries(
                 )
             )
             continue
-        outcomes.append(attempt(key, url, payload))
+        target_payload = payload(key) if callable(payload) else payload
+        outcomes.append(attempt(key, url, target_payload))
     return outcomes
 
 
@@ -507,6 +558,48 @@ def run_webhook_diagnostic() -> int:
     return 0
 
 
+def run_test_send() -> int:
+    """
+    Send a clearly-marked test alert through the real delivery path to every
+    configured webhook -- including each webhook's role ping -- without
+    fetching the feed or touching state.
+    """
+    targets = get_webhook_targets()
+    if not targets:
+        log_error(
+            "No Discord webhook URLs configured "
+            "(DISCORD_WEBHOOK_URL / DISCORD_WEBHOOK_URL_2)."
+        )
+        return 1
+
+    chapter = {
+        "chapter_number": "TEST",
+        "title": "One Piece chapter alert test",
+        "url": SERIES_URL,
+        "pub_date": "",
+    }
+    log_info(f"Sending a test notification to {len(targets)} webhook(s); state is not touched.")
+    outcomes = attempt_deliveries(
+        targets,
+        lambda key: build_new_chapter_payload(
+            chapter, role_id=get_webhook_role_id(key), test=True
+        ),
+    )
+
+    for outcome in outcomes:
+        if outcome.ok:
+            log_ok(f"Test notification delivered to {outcome.key}.")
+        else:
+            log_error(f"Test notification failed for {outcome.key}: {outcome.detail}")
+
+    failures = [outcome for outcome in outcomes if not outcome.ok]
+    if failures:
+        log_error(f"{len(failures)}/{len(targets)} test notification(s) failed.")
+        return 1
+    log_ok(f"Test notification delivered to all {len(targets)} webhook(s).")
+    return 0
+
+
 def _send_quarantine_alerts(quarantined: dict, targets: list[tuple[str, str]]) -> bool:
     """
     Tell the surviving webhook(s) about freshly quarantined ones, once each.
@@ -554,6 +647,12 @@ def parse_args():
         help="Check every configured Discord webhook (sends no messages, writes no state) and exit.",
     )
     parser.add_argument(
+        "--send-test",
+        action="store_true",
+        help="Send a clearly-marked test notification (role ping included) to every configured "
+        "webhook without touching state, then exit.",
+    )
+    parser.add_argument(
         "--force-state",
         metavar="CHAPTER_NUMBER",
         type=float,
@@ -589,6 +688,9 @@ def main() -> int:
 
     if args.check_webhooks:
         return run_webhook_diagnostic()
+
+    if args.send_test:
+        return run_test_send()
 
     try:
         latest = fetch_latest_chapter()
@@ -666,7 +768,10 @@ def main() -> int:
             save_state(chapter, delivered_to, quarantined)
         return 0
 
-    outcomes = attempt_deliveries(pending, build_new_chapter_payload(chapter))
+    outcomes = attempt_deliveries(
+        pending,
+        lambda key: build_new_chapter_payload(chapter, role_id=get_webhook_role_id(key)),
+    )
     for outcome in outcomes:
         if outcome.ok:
             log_ok(f"Notified {outcome.key} ({mask_webhook(target_map[outcome.key])}).")

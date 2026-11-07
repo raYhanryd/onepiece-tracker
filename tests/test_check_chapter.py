@@ -118,6 +118,40 @@ class NotificationPayloadTests(unittest.TestCase):
         self.assertNotIn("Published", json.dumps(embed))
         self.assertNotIn("26 Sep 2026", json.dumps(embed))
 
+    def test_role_ping_is_opt_in_per_webhook(self):
+        chapter = {
+            "chapter_number": 1194,
+            "title": "One Piece Chapter 1194",
+            "url": "https://weebcentral.com/chapters/new",
+            "pub_date": "",
+        }
+        plain = check_chapter.build_new_chapter_payload(chapter)
+        pinged = check_chapter.build_new_chapter_payload(
+            chapter, role_id="1568322226804232304"
+        )
+
+        self.assertNotIn("content", plain)
+        self.assertNotIn("allowed_mentions", plain)
+        self.assertEqual(pinged["content"], "<@&1568322226804232304>")
+        self.assertEqual(
+            pinged["allowed_mentions"],
+            {"parse": [], "roles": ["1568322226804232304"]},
+        )
+        # The ping is message content; the embed itself is unchanged.
+        self.assertEqual(pinged["embeds"][0]["title"], plain["embeds"][0]["title"])
+        self.assertEqual(pinged["embeds"][0]["url"], plain["embeds"][0]["url"])
+        self.assertNotIn("<@&", json.dumps(pinged["embeds"]))
+
+    def test_test_payload_is_marked_as_a_test(self):
+        payload = check_chapter.build_new_chapter_payload(
+            {"chapter_number": "TEST", "title": "One Piece chapter alert test", "url": "u"},
+            role_id="123",
+            test=True,
+        )
+        self.assertTrue(payload["embeds"][0]["title"].startswith("[TEST]"))
+        self.assertIn("not a new chapter", payload["embeds"][0]["description"])
+        self.assertEqual(payload["content"], "<@&123>")
+
 
 class ReconcileQuarantineTests(unittest.TestCase):
     def test_keeps_matching_entry(self):
@@ -149,6 +183,21 @@ class DeliveryTests(unittest.TestCase):
         )
         self.assertEqual(calls, [])
         self.assertTrue(outcomes[0].permanent)
+
+    def test_payload_can_differ_per_webhook(self):
+        seen = {}
+
+        def fake_attempt(key, url, payload):
+            seen[key] = payload
+            return outcome(key, True)
+
+        check_chapter.attempt_deliveries(
+            [(KEY_A, URL_A), (KEY_B, URL_B)],
+            lambda key: {"embeds": [], "target": key},
+            attempt=fake_attempt,
+        )
+        self.assertEqual(seen[KEY_A]["target"], KEY_A)
+        self.assertEqual(seen[KEY_B]["target"], KEY_B)
 
     def test_transient_failure_retries_then_succeeds(self):
         calls = {"count": 0}
@@ -337,6 +386,25 @@ class MainFlowTests(unittest.TestCase):
         self.assertEqual(self.run_main(self.chapter(1194), [(KEY_A, URL_A), (KEY_B, URL_B)], post), 0)
         self.assertEqual(posted, [], "nothing pending, so nothing should be sent again")
 
+    def test_role_ping_is_added_only_to_webhook_two(self):
+        payloads = {}
+
+        def post(url, payload):
+            payloads[url] = payload
+            return None
+
+        with mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": "1568322226804232304"}):
+            rc = self.run_main(self.chapter(1194), [(KEY_A, URL_A), (KEY_B, URL_B)], post)
+
+        self.assertEqual(rc, 0)
+        self.assertNotIn("content", payloads[URL_A])
+        self.assertNotIn("allowed_mentions", payloads[URL_A])
+        self.assertEqual(payloads[URL_B]["content"], "<@&1568322226804232304>")
+        self.assertEqual(
+            payloads[URL_B]["allowed_mentions"]["roles"],
+            ["1568322226804232304"],
+        )
+
     def test_transient_failure_retries_only_the_failed_webhook_later(self):
         posted = []
 
@@ -426,6 +494,87 @@ class MainFlowTests(unittest.TestCase):
         rc = self.run_main(self.chapter(1194), [], lambda url, payload: None)
         self.assertEqual(rc, 1)
         self.assertFalse(os.path.exists(self.state_path))
+
+
+class SendTestTests(unittest.TestCase):
+    """`--send-test`: real delivery path, no state, no feed fetch."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state_path = os.path.join(self._tmp.name, "last_chapter.json")
+        state_patcher = mock.patch.object(check_chapter, "STATE_PATH", self.state_path)
+        state_patcher.start()
+        self.addCleanup(state_patcher.stop)
+        argv_patcher = mock.patch.object(sys, "argv", ["check_chapter.py", "--send-test"])
+        argv_patcher.start()
+        self.addCleanup(argv_patcher.stop)
+
+    @mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": "1568322226804232304"})
+    def test_sends_marked_test_to_every_webhook_and_pings_only_the_second(self):
+        payloads = {}
+
+        def post(url, payload):
+            payloads[url] = payload
+            return None
+
+        with mock.patch.object(
+            check_chapter, "get_webhook_targets", lambda: [(KEY_A, URL_A), (KEY_B, URL_B)]
+        ), \
+                mock.patch.object(
+                    check_chapter, "fetch_latest_chapter",
+                    side_effect=AssertionError("test mode must not fetch the feed"),
+                ), \
+                mock.patch.object(check_chapter, "_post_to_discord_webhook", post), \
+                mock.patch.object(check_chapter.time, "sleep"):
+            rc = check_chapter.main()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(set(payloads), {URL_A, URL_B})
+        self.assertTrue(payloads[URL_A]["embeds"][0]["title"].startswith("[TEST]"))
+        self.assertNotIn("content", payloads[URL_A])
+        self.assertEqual(payloads[URL_B]["content"], "<@&1568322226804232304>")
+        self.assertFalse(os.path.exists(self.state_path), "test sends must not write state")
+
+    def test_reports_failure_when_a_test_send_fails(self):
+        def post(url, payload):
+            raise make_http_error(url, 404, b'{"message": "Unknown Webhook"}')
+
+        with mock.patch.object(check_chapter, "get_webhook_targets", lambda: [(KEY_B, URL_B)]), \
+                mock.patch.object(check_chapter, "_post_to_discord_webhook", post), \
+                mock.patch.object(check_chapter.time, "sleep"):
+            rc = check_chapter.main()
+
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(self.state_path))
+
+
+class RoleIdConfigTests(unittest.TestCase):
+    """The role ping comes from an env var/repo variable, never the code."""
+
+    def test_webhook_two_role_variable_name(self):
+        self.assertEqual(check_chapter.WEBHOOK_ROLE_ENV_VARS[KEY_B], "DISCORD_ROLE_ID_2")
+
+    def test_unset_variable_means_no_ping(self):
+        with mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": ""}):
+            self.assertIsNone(check_chapter.get_webhook_role_id(KEY_B))
+
+    def test_accepts_bare_id_or_full_mention(self):
+        for raw in ("1568322226804232304", "<@&1568322226804232304>", " 1568322226804232304 "):
+            with mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": raw}):
+                self.assertEqual(
+                    check_chapter.get_webhook_role_id(KEY_B), "1568322226804232304"
+                )
+
+    def test_invalid_value_is_ignored(self):
+        with mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": "not-a-role"}):
+            self.assertIsNone(check_chapter.get_webhook_role_id(KEY_B))
+
+    def test_first_webhook_never_gets_a_role_ping(self):
+        with mock.patch.dict(
+            os.environ, {"DISCORD_ROLE_ID_2": "1568322226804232304", "DISCORD_ROLE_ID": "999"}
+        ):
+            self.assertIsNone(check_chapter.get_webhook_role_id(KEY_A))
 
 
 if __name__ == "__main__":
