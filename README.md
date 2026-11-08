@@ -92,9 +92,11 @@ Create the variable here: repo → Settings → Secrets and variables →
 Actions → **Variables** tab → New repository variable. Name:
 `DISCORD_ROLE_ID_2`, value: `1568322226804232304`. It is an ID, not a
 credential, so a variable (not a secret) is the right place. If it is
-unset, webhook 2 still gets the alert — just without a ping. To change
-the role later, edit the variable; no code change needed. If the mention
-shows up but nobody is notified, make the role mentionable
+unset or not numeric, the alert is still delivered without a ping, but it
+is no longer silent: normal runs log a `[WARN]`, a chapter run that sent
+without the ping exits non-zero, and `--send-test` / `--check-webhooks`
+fail. To change the role later, edit the variable; no code change needed.
+If the mention shows up but nobody is notified, make the role mentionable
 (Role settings → Display → Allow anyone to @mention this role).
 
 Per-destination delivery tracking means a failure on one webhook never
@@ -187,9 +189,11 @@ python3 scripts/check_chapter.py --send-test
 Delivers a clearly marked `[TEST]` alert through the real delivery path
 to every configured webhook — including webhook 2's role ping — without
 fetching the feed or touching `state/last_chapter.json`. Exit code is
-non-zero if any destination fails. The same thing runs from GitHub
-Actions with the `send-test` dispatch mode (see below), which is the
-easiest way to test the real secrets.
+non-zero if any destination fails. If a role ping is expected but its
+variable is missing or invalid, the test refuses to send anything and
+exits non-zero, so it cannot pass with a silent no-ping. The same thing
+runs from GitHub Actions with the `send-test` dispatch mode (see below),
+which is the easiest way to test the real secrets.
 
 **7. Run the unit tests:**
 
@@ -210,8 +214,9 @@ repo → Actions → "Check for new One Piece chapter" → Run workflow. The
 - `check` (default) — the normal check.
 - `dry-run` — fetch and print the latest chapter, send nothing.
 - `check-webhooks` — GET each configured webhook without sending a
-  message; reports OK or DEAD per secret. Use this after rotating a
-  webhook URL, or when you suspect one is broken.
+  message; reports OK or DEAD per secret, and fails if an expected role
+  ping variable is missing or invalid. Use this after rotating a webhook
+  URL, or when you suspect one is broken.
 - `send-test` — send a marked `[TEST]` alert (role ping included) to
   every configured webhook. Sends nothing to state, so the next real
   check still behaves normally.

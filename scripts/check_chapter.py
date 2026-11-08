@@ -12,8 +12,9 @@ Exit codes:
   0 = success -- a new chapter was announced to every active webhook, or
       there was nothing to do. A permanently-dead webhook is quarantined
       (and the surviving webhook is told about it) without failing the run.
-  1 = failure -- feed unreachable/unparsable, no usable webhook, or a
-      delivery that WILL BE RETRIED next run. NOT the same as
+  1 = failure -- feed unreachable/unparsable, no usable webhook, a
+      delivery that WILL BE RETRIED next run, or a chapter that had to be
+      delivered without an expected role ping. NOT the same as
       "no new chapter" and must be treated as an alert.
 """
 
@@ -49,7 +50,9 @@ WEBHOOK_ENV_VARS = ("DISCORD_WEBHOOK_URL", "DISCORD_WEBHOOK_URL_2")
 # Optional per-webhook role pings, configured outside the code: each entry
 # maps a webhook env var to the env var holding its Discord role ID. In
 # GitHub Actions that is a repo *variable* (not a secret -- role IDs are not
-# sensitive). Unset = that webhook's alerts carry no ping.
+# sensitive). An entry means the ping is expected: unset/invalid values are
+# reported loudly and fail the test/diagnostic modes rather than passing
+# silently. Remove the entry to intentionally disable a role ping.
 WEBHOOK_ROLE_ENV_VARS = {
     "DISCORD_WEBHOOK_URL_2": "DISCORD_ROLE_ID_2",
 }
@@ -156,7 +159,9 @@ def get_webhook_role_id(key: str) -> str | None:
     Resolve the optional role ping for one webhook from its env var.
 
     Accepts a bare snowflake or a "<@&123...>" mention; anything else is
-    ignored so a typo cannot produce a malformed message.
+    ignored so a typo cannot produce a malformed message. This helper stays
+    quiet because it also runs while building payloads; use
+    `role_ping_config_issues()` when the result needs to be reported.
     """
     env_var = WEBHOOK_ROLE_ENV_VARS.get(key)
     if not env_var:
@@ -166,10 +171,38 @@ def get_webhook_role_id(key: str) -> str | None:
         return None
     if raw.startswith("<@&") and raw.endswith(">"):
         raw = raw[3:-1]
-    if not raw.isdigit():
-        log_warn(f"{env_var} is not a numeric Discord role ID; skipping that ping.")
-        return None
-    return raw
+    return raw if raw.isdigit() else None
+
+
+def role_ping_config_issues(targets: list[tuple[str, str]]) -> list[str]:
+    """
+    Report every configured webhook that is expected to ping a role but cannot.
+
+    A missing/malformed role ID never blocks the chapter alert -- the embed is
+    still delivered -- but it must never pass silently. Each problem gets a
+    [WARN] here; callers decide whether it should also fail the run.
+    """
+    issues: list[str] = []
+    for key, _ in targets:
+        env_var = WEBHOOK_ROLE_ENV_VARS.get(key)
+        if not env_var:
+            continue
+        raw = (os.environ.get(env_var) or "").strip()
+        if not raw:
+            issue = (
+                f"{key}: no role ping -- {env_var} is unset. Add it as a repo "
+                "variable (Settings -> Secrets and variables -> Actions -> "
+                "Variables), not as a secret."
+            )
+        elif get_webhook_role_id(key) is None:
+            issue = (
+                f"{key}: no role ping -- {env_var} is not a numeric Discord role ID."
+            )
+        else:
+            continue
+        log_warn(issue)
+        issues.append(issue)
+    return issues
 
 
 def get_webhook_targets() -> list[tuple[str, str]]:
@@ -515,6 +548,7 @@ def run_webhook_diagnostic() -> int:
 
     failures = 0
     by_fingerprint: dict[str, list[str]] = {}
+    role_ping_issues = role_ping_config_issues(targets)
     log_info(f"Checking {len(targets)} configured webhook(s); no messages are sent.")
 
     for key, url in targets:
@@ -553,8 +587,16 @@ def run_webhook_diagnostic() -> int:
 
     if failures:
         log_error(f"{failures}/{len(targets)} webhook(s) are not usable.")
+    if role_ping_issues:
+        log_error(
+            f"{len(role_ping_issues)} role ping(s) are misconfigured -- chapter alerts "
+            "will be delivered without a ping until this is fixed."
+        )
+    if failures or role_ping_issues:
         return 1
-    log_ok(f"All {len(targets)} webhook(s) look healthy.")
+    log_ok(
+        f"All {len(targets)} webhook(s) look healthy, with role pings where configured."
+    )
     return 0
 
 
@@ -569,6 +611,15 @@ def run_test_send() -> int:
         log_error(
             "No Discord webhook URLs configured "
             "(DISCORD_WEBHOOK_URL / DISCORD_WEBHOOK_URL_2)."
+        )
+        return 1
+
+    role_ping_issues = role_ping_config_issues(targets)
+    if role_ping_issues:
+        log_error(
+            "Test send refused: an expected role ping is misconfigured, so this "
+            "test could not verify it. No messages were sent. Fix the repo "
+            "variable(s) named in the [WARN] lines above, then run --send-test again."
         )
         return 1
 
@@ -711,6 +762,7 @@ def main() -> int:
 
     targets = get_webhook_targets()
     target_map = dict(targets)
+    role_ping_issues = role_ping_config_issues(targets)
 
     stored_quarantine = state.get("quarantined", {}) if state else {}
     quarantined = reconcile_quarantine(stored_quarantine, targets)
@@ -812,6 +864,7 @@ def main() -> int:
     if _send_quarantine_alerts(quarantined, targets):
         save_state(chapter, delivered_to, quarantined)
 
+    exit_code = 0
     if retry_failures:
         details = " | ".join(f"{outcome.key}: {outcome.detail}" for outcome in retry_failures)
         log_error(
@@ -819,7 +872,18 @@ def main() -> int:
             "State was saved, so the webhook(s) that succeeded will NOT be re-notified; "
             f"the failed one(s) will be retried next run. Details: {details}"
         )
-        return 1
+        exit_code = 1
+
+    if role_ping_issues:
+        log_error(
+            "Chapter alert delivered WITHOUT the configured role ping. Fix the repo "
+            "variable(s) named in the [WARN] lines above; run --send-test or "
+            "--check-webhooks to confirm before the next chapter."
+        )
+        exit_code = 1
+
+    if exit_code:
+        return exit_code
 
     log_ok(
         f"New chapter recorded: {chapter.get('title') or chapter.get('chapter_number')} "

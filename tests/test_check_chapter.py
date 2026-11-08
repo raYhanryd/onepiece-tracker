@@ -271,6 +271,13 @@ class StateFileTests(unittest.TestCase):
 
 
 class DiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        env_patcher = mock.patch.dict(
+            os.environ, {"DISCORD_ROLE_ID_2": "1568322226804232304"}
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
     def test_reports_dead_webhook(self):
         with mock.patch.object(check_chapter, "get_webhook_targets", lambda: [(KEY_A, URL_A)]), \
                 mock.patch.object(
@@ -288,6 +295,18 @@ class DiagnosticTests(unittest.TestCase):
                 mock.patch.object(sys, "argv", ["check_chapter.py", "--check-webhooks"]):
             rc = check_chapter.main()
         self.assertEqual(rc, 0)
+
+    def test_missing_role_variable_fails_the_diagnostic(self):
+        body = json.dumps({"name": "onepiece", "channel_id": "123"})
+        with mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": ""}), \
+                mock.patch.object(
+                    check_chapter, "get_webhook_targets",
+                    lambda: [(KEY_A, URL_A), (KEY_B, URL_B)],
+                ), \
+                mock.patch.object(check_chapter, "_fetch_webhook_info", lambda url: (200, body)), \
+                mock.patch.object(sys, "argv", ["check_chapter.py", "--check-webhooks"]):
+            rc = check_chapter.main()
+        self.assertEqual(rc, 1)
 
     def test_two_secrets_on_the_same_webhook_are_only_warned_about(self):
         body = json.dumps({"name": "onepiece", "channel_id": "123"})
@@ -313,6 +332,11 @@ class MainFlowTests(unittest.TestCase):
         argv_patcher = mock.patch.object(sys, "argv", ["check_chapter.py"])
         argv_patcher.start()
         self.addCleanup(argv_patcher.stop)
+        env_patcher = mock.patch.dict(
+            os.environ, {"DISCORD_ROLE_ID_2": "1568322226804232304"}
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
 
     def write_state(self, **overrides):
         payload = {
@@ -404,6 +428,23 @@ class MainFlowTests(unittest.TestCase):
             payloads[URL_B]["allowed_mentions"]["roles"],
             ["1568322226804232304"],
         )
+
+    def test_missing_role_variable_is_loud_but_still_delivers(self):
+        payloads = {}
+
+        def post(url, payload):
+            payloads[url] = payload
+            return None
+
+        with mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": ""}):
+            rc = self.run_main(self.chapter(1194), [(KEY_A, URL_A), (KEY_B, URL_B)], post)
+
+        self.assertEqual(rc, 1, "missing role ping must fail the run")
+        self.assertEqual(set(payloads), {URL_A, URL_B}, "the chapter must still be delivered")
+        self.assertNotIn("content", payloads[URL_B])
+        state = self.read_state()
+        self.assertEqual(state["delivered_to"], [KEY_A, KEY_B])
+        self.assertEqual(state["quarantined"], {})
 
     def test_transient_failure_retries_only_the_failed_webhook_later(self):
         posted = []
@@ -509,6 +550,11 @@ class SendTestTests(unittest.TestCase):
         argv_patcher = mock.patch.object(sys, "argv", ["check_chapter.py", "--send-test"])
         argv_patcher.start()
         self.addCleanup(argv_patcher.stop)
+        env_patcher = mock.patch.dict(
+            os.environ, {"DISCORD_ROLE_ID_2": "1568322226804232304"}
+        )
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
 
     @mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": "1568322226804232304"})
     def test_sends_marked_test_to_every_webhook_and_pings_only_the_second(self):
@@ -535,6 +581,25 @@ class SendTestTests(unittest.TestCase):
         self.assertNotIn("content", payloads[URL_A])
         self.assertEqual(payloads[URL_B]["content"], "<@&1568322226804232304>")
         self.assertFalse(os.path.exists(self.state_path), "test sends must not write state")
+
+    def test_refuses_to_send_when_the_expected_role_ping_is_missing(self):
+        posted = []
+
+        def post(url, payload):
+            posted.append(url)
+            return None
+
+        with mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": ""}), \
+                mock.patch.object(
+                    check_chapter, "get_webhook_targets",
+                    lambda: [(KEY_A, URL_A), (KEY_B, URL_B)],
+                ), \
+                mock.patch.object(check_chapter, "_post_to_discord_webhook", post):
+            rc = check_chapter.main()
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(posted, [], "a test that cannot verify the ping must send nothing")
+        self.assertFalse(os.path.exists(self.state_path))
 
     def test_reports_failure_when_a_test_send_fails(self):
         def post(url, payload):
@@ -575,6 +640,21 @@ class RoleIdConfigTests(unittest.TestCase):
             os.environ, {"DISCORD_ROLE_ID_2": "1568322226804232304", "DISCORD_ROLE_ID": "999"}
         ):
             self.assertIsNone(check_chapter.get_webhook_role_id(KEY_A))
+
+    def test_reports_unset_and_invalid_values(self):
+        targets = [(KEY_A, URL_A), (KEY_B, URL_B)]
+        with mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": ""}):
+            issues = check_chapter.role_ping_config_issues(targets)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("DISCORD_ROLE_ID_2 is unset", issues[0])
+
+        with mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": "not-a-role"}):
+            issues = check_chapter.role_ping_config_issues(targets)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("not a numeric Discord role ID", issues[0])
+
+        with mock.patch.dict(os.environ, {"DISCORD_ROLE_ID_2": "1568322226804232304"}):
+            self.assertEqual(check_chapter.role_ping_config_issues(targets), [])
 
 
 if __name__ == "__main__":
