@@ -1,240 +1,164 @@
 # One Piece Chapter Tracker → Discord
 
-Checks weebcentral's One Piece RSS feed on a schedule and posts a Discord
-notification when a new chapter drops. Runs entirely on GitHub Actions —
-no server, no paid hosting. Same pattern as `email-digest-gemini`.
+A zero-server GitHub Actions bot that watches the One Piece RSS feed and posts a clean Discord alert when a new chapter is released. No server, database, or paid hosting — the repository itself is the state store.
 
-## How it works
+The project is designed to be copied: each person runs their own instance with their own Discord webhook(s), optional role ping, and schedule. It is intentionally One Piece-only today; see [Tracking another series](#tracking-another-series).
 
-- `scripts/check_chapter.py` fetches weebcentral's series RSS feed
-  (`/series/<id>/rss`), which is far more stable than scraping the HTML
-  page directly.
-- It compares the latest chapter number to what's stored in
-  `state/last_chapter.json`.
-- If it's new: sends a Discord embed notification to every configured
-  webhook, then updates and commits the state file back to the repo.
-  Alerts sent to the second webhook also ping that server's role, whose ID
-  comes from the repo variable `DISCORD_ROLE_ID_2`; the first webhook's
-  message is unchanged and pings nobody.
-- If it's not new: does nothing (after retrying any delivery that failed
-  on an earlier run).
-- The state file records *which* webhooks already received the current
-  chapter, so a webhook that fails can never cause duplicate messages in
-  the ones that succeeded. Failed deliveries are retried on the next run,
-  only for the webhook(s) that actually failed.
-- If the feed can't be fetched or parsed (site down, feed structure
-  changed, etc.): this is treated as a **failure**, not "no new chapter."
-  The script exits non-zero and logs a loud `[ERROR]` block, so the
-  GitHub Actions run shows as failed and you'll get notified.
-- If a webhook is *permanently* dead (HTTP 401/403/404 — deleted webhook
-  or channel), it is **quarantined**: the script stops retrying it, keeps
-  the other webhook(s) working, tells the surviving channel about it once,
-  and the run still succeeds. Delete or replace that secret and the
-  quarantine clears by itself.
+## What you get
 
-## Why RSS instead of HTML scraping
+- A Discord embed with the chapter title, link, and a short “new chapter” message.
+- One or two independent Discord destinations. The second can ping a role; the first stays mention-free.
+- Per-webhook delivery tracking, so a failure on one webhook never re-notifies the ones that already succeeded.
+- Automatic retries for transient errors, and quarantine for webhooks that are permanently dead (401/403/404).
+- Loud failures for feed errors and misconfiguration. “No new chapter” and “the check broke” are deliberately different outcomes.
+- 43 offline unit tests, no network or Discord account required.
+- Python standard library only. Nothing to install.
 
-The original plan was to scrape the series page directly, but weebcentral
-exposes a proper RSS feed per series (linked from the series page under
-"Track"). It gives clean chapter titles, direct chapter URLs, and publish
-dates — no need to guess at CSS selectors or handle layout changes. It's
-still fetched with a real browser `User-Agent` header, since some
-weebcentral-adjacent infra 403s bare requests.
+## Quick start
 
-**Maintenance note:** if weebcentral changes their RSS feed path/format or
-retires it, `fetch_latest_chapter()` in `scripts/check_chapter.py` is the
-only place that needs updating — the regex extracting the chapter number
-from the item title (`CHAPTER_NUM_RE`) is the most likely thing to break.
+### 1. Create your own copy
 
-## Setup
+On GitHub, **Fork** this repository (or use **Use this template → Create a new repository** if it is enabled).
 
-### 1. Create the repo
+If you fork, open the **Actions** tab and enable workflows first — GitHub disables scheduled workflows on forks by default. A template-created repository is a fresh repository; check that Actions is enabled in its **Actions** tab.
 
-```bash
-cd onepiece-tracker
-git init
-git add .
-git commit -m "Initial commit: One Piece chapter tracker"
-gh repo create onepiece-tracker --private --source=. --remote=origin
-git push -u origin main
-```
+Do not put webhook URLs in the repository, issues, or logs. They are bearer credentials.
 
-(Or create the private repo on github.com first, then `git remote add origin <url>` and push.)
+### 2. Add at least one Discord webhook
 
-### 2. Add the Discord webhook secret(s)
-
-1. In Discord: Server Settings → Integrations → Webhooks → New Webhook.
-   Pick the channel you want notifications in, copy the webhook URL.
-2. In GitHub: repo → Settings → Secrets and variables → Actions →
-   New repository secret.
+1. In Discord: **Server Settings → Integrations → Webhooks → New Webhook**.
+2. Pick the channel, create the webhook, and copy its URL.
+3. In your GitHub repo: **Settings → Secrets and variables → Actions → New repository secret**.
    - Name: `DISCORD_WEBHOOK_URL`
    - Value: the webhook URL from Discord
 
-The script reads this from the environment — it's never hardcoded
-anywhere in the repo.
+That is the minimum configuration. The workflow already passes the secret into the script.
 
-**Sending to a second server/channel too:** repeat step 1 in the other
-Discord server to get a second webhook URL, then add it as a second
-repo secret named `DISCORD_WEBHOOK_URL_2`. The workflow already passes
-it through, and the script sends the same notification to every
-*configured* webhook — with only one secret set, the second destination
-simply doesn't exist. To add a third, fourth, etc., extend the
-`WEBHOOK_ENV_VARS` tuple in `scripts/check_chapter.py` and add a matching
-secret + env line in `.github/workflows/check-chapter.yml`.
+### 3. Optional: add a second destination and a role ping
 
-**Role ping on the second webhook:** alerts delivered to
-`DISCORD_WEBHOOK_URL_2` mention the role in the repository variable
-`DISCORD_ROLE_ID_2` (value `1568322226804232304`), with an explicit
-`allowed_mentions` entry so Discord actually pushes the ping. Alerts to
-`DISCORD_WEBHOOK_URL` do not mention anyone.
+Repeat the Discord webhook steps in the second server/channel, then add a second repository secret:
 
-Create the variable here: repo → Settings → Secrets and variables →
-Actions → **Variables** tab → New repository variable. Name:
-`DISCORD_ROLE_ID_2`, value: `1568322226804232304`. It is an ID, not a
-credential, so a variable (not a secret) is the right place. If it is
-unset or not numeric, the alert is still delivered without a ping, but it
-is no longer silent: normal runs log a `[WARN]`, a chapter run that sent
-without the ping exits non-zero, and `--send-test` / `--check-webhooks`
-fail. To change the role later, edit the variable; no code change needed.
-If the mention shows up but nobody is notified, make the role mentionable
-(Role settings → Display → Allow anyone to @mention this role).
+- Name: `DISCORD_WEBHOOK_URL_2`
+- Value: the second webhook URL
 
-Per-destination delivery tracking means a failure on one webhook never
-re-notifies the others, and a permanently dead webhook gets quarantined
-(with a one-time heads-up in the surviving channel) instead of failing
-every run.
+The script treats a configured webhook 2 as **expecting a role ping**. Add a repository **variable** (not a secret):
 
-### 3. Permissions for `GITHUB_TOKEN`
+- Go to **Settings → Secrets and variables → Actions → Variables → New repository variable**
+- Name: `DISCORD_ROLE_ID_2`
+- Value: the numeric Discord role ID (for example, the ID copied with Developer Mode enabled)
 
-The workflow needs to commit the updated `state/last_chapter.json` back
-to the repo after a new chapter is found. This requires:
+The role ID is not a credential. If it is missing or non-numeric, the chapter alert is still delivered without a ping, but the run exits non-zero so the problem is visible. `--send-test` and `--check-webhooks` refuse to pass in that state. If you want webhook 2 without a ping, remove the `DISCORD_WEBHOOK_URL_2` entry from `WEBHOOK_ROLE_ENV_VARS` in `scripts/check_chapter.py`.
+
+If the mention appears but nobody is notified, make the role mentionable: **Role settings → Display → Allow anyone to @mention this role**.
+
+### 4. Confirm Actions can commit state
+
+The workflow needs to write `state/last_chapter.json` back to the repo after a new chapter is found. The workflow already declares:
 
 ```yaml
 permissions:
   contents: write
 ```
 
-This is already set at the top of `.github/workflows/check-chapter.yml`.
-Without it, the push step in the workflow will fail with a permissions
-error. (Note: if your org/repo has a stricter default workflow
-permissions setting under Settings → Actions → General, make sure
-"Read and write permissions" is allowed, or this `permissions:` block
-being scoped correctly may still get overridden.)
+If your organization restricts workflow permissions, allow read/write under **Settings → Actions → General → Workflow permissions**.
 
-## Testing locally before relying on the schedule
+### 5. Test before waiting for a chapter
 
-You'll need Python 3.10+ (for the `dict | None` type hint used in the
-script — bump the annotation or drop it if you're on an older Python).
+From the **Actions** tab, open **Check for new One Piece chapter → Run workflow** and choose:
 
-**1. Dry run — see what the script would do, without side effects:**
+1. `check-webhooks` — verifies every configured webhook without sending a message.
+2. `send-test` — sends a clearly marked `[TEST]` alert through the real delivery path. It does not touch the chapter state.
+
+The same checks are available locally (see [Testing locally](#testing-locally)).
+
+The repository ships with the state at the latest recorded chapter, so a new copy will not announce chapters that were already recorded. To exercise a real “new chapter” run for your own webhook, use `--force-state` with a lower number, then run a normal check. That will send an alert; only do it when you are ready.
+
+## Configuration reference
+
+| Kind | Name | Required | Purpose |
+|---|---|---|---|
+| Secret | `DISCORD_WEBHOOK_URL` | Yes, or use webhook 2 instead | First Discord destination |
+| Secret | `DISCORD_WEBHOOK_URL_2` | No | Second Discord destination |
+| Variable | `DISCORD_ROLE_ID_2` | Yes when webhook 2 is set | Role ping for webhook 2 |
+| File | `state/last_chapter.json` | Yes | Last-seen chapter and per-webhook delivery ledger |
+
+At least one webhook must be configured. Unset webhooks are skipped, so one secret means one destination. Adding a third destination requires extending `WEBHOOK_ENV_VARS` in `scripts/check_chapter.py`, adding the secret, and adding the env line in the workflow.
+
+## How it works
+
+1. GitHub Actions wakes up on the cron schedule, or from **Run workflow**.
+2. `scripts/check_chapter.py` fetches weebcentral’s RSS feed with a browser-like `User-Agent`.
+3. It extracts the latest chapter number, title, URL, and publish date.
+4. It compares that chapter with `state/last_chapter.json`.
+5. If the chapter is new, it builds the Discord payload per destination: webhook 2 gets the optional role mention, webhook 1 does not.
+6. It records each successful delivery independently in `delivered_to`.
+7. It commits the updated state file with `[skip ci]`. The workflow serializes runs with a `concurrency` group and rebases before pushing.
+
+If there is no new chapter, the script retries only destinations that are still pending from an earlier failed run, then exits successfully when there is nothing left to do.
+
+### Why RSS instead of HTML scraping
+
+weebcentral exposes a per-series RSS feed with clean titles, links, and publish dates. That is more stable than guessing at page selectors. The feed is still fetched with a real browser `User-Agent`, because some weebcentral-adjacent infrastructure rejects bare requests.
+
+The most likely maintenance point is the chapter-number regex (`CHAPTER_NUM_RE`) in `scripts/check_chapter.py`. If the site starts publishing titles like “Ch. 1199” instead of “Chapter 1199”, that is the line to update.
+
+### Reliability details
+
+- **State is a delivery ledger, not one boolean.** `delivered_to` lists the webhook env-var names that already received the current chapter.
+- **Transient failures** (timeouts, 429, 5xx) are retried in-run with backoff, then retried on the next scheduled run — only for the destination that failed.
+- **Permanent failures** (401/403/404) quarantine that webhook. The surviving channel gets one heads-up; the run stays green. Replacing the secret changes the stored URL fingerprint, which clears the quarantine automatically.
+- **The last usable webhook is never quarantined.** With no working destination, the run keeps failing loudly rather than silently dropping alerts.
+- **Feed failures are alerts.** A fetch or parse error exits 1 and logs an `[ERROR]` block; it is never treated as “no new chapter”.
+- **Missing role ping is loud too.** The chapter is delivered without the ping, then the run exits 1, so a silent configuration regression is visible.
+
+Webhook URLs are never written to the repo. Quarantine entries contain only the env-var name and a truncated SHA-256 fingerprint of the URL.
+
+## Testing locally
+
+You need Python 3.10+; there are no third-party dependencies.
 
 ```bash
+# Offline unit tests — no network, Discord, or credentials needed
+python3 -m unittest discover -s tests -v
+
+# Fetch and print the latest chapter; no message, no state change
 python3 scripts/check_chapter.py --dry-run
-```
 
-This fetches the real latest chapter from weebcentral and prints it.
-No Discord message sent, no state file changes.
-
-**2. Simulate "there IS a new chapter":**
-
-```bash
-# Pretend the last-seen chapter was one behind the real latest
-python3 scripts/check_chapter.py --force-state 1185
-
-# Now run normally — it should detect the real latest as "new"
-export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-python3 scripts/check_chapter.py
-```
-
-Check your Discord channel for the notification, and check
-`state/last_chapter.json` — it should now reflect the real latest chapter.
-
-**3. Confirm "no new chapter" doesn't misfire:**
-
-```bash
-# Run again immediately, right after the run above
-python3 scripts/check_chapter.py
-```
-
-You should see `[OK] No new chapter (still <N>). No action taken.` in the
-logs, and no second Discord message.
-
-**4. Confirm failures are loud:**
-
-Temporarily break something — e.g. set `DISCORD_WEBHOOK_URL` to garbage,
-or point `RSS_URL` in the script at a bad URL — and confirm you get an
-`[ERROR]` block and a non-zero exit code (`echo $?` after running should
-print `1`).
-
-**5. Check your webhooks without sending anything:**
-
-```bash
+# Check configured webhooks without sending anything
 export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
 python3 scripts/check_chapter.py --check-webhooks
-```
 
-This GETs each configured webhook and reports OK or DEAD (`HTTP 404`
-usually means the webhook was deleted or its channel is gone). No
-messages are sent and the state file is not touched.
-
-**6. Send a test notification:**
-
-```bash
+# Send a marked [TEST] alert through the real delivery path
 export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
 export DISCORD_WEBHOOK_URL_2="https://discord.com/api/webhooks/..."
-export DISCORD_ROLE_ID_2="1568322226804232304"  # same value as the repo variable
+export DISCORD_ROLE_ID_2="YOUR_ROLE_ID"  # only if webhook 2 expects a ping
 python3 scripts/check_chapter.py --send-test
+
+# Pretend the last-seen chapter was one behind, so the next real run sends
+python3 scripts/check_chapter.py --force-state 1197
 ```
 
-Delivers a clearly marked `[TEST]` alert through the real delivery path
-to every configured webhook — including webhook 2's role ping — without
-fetching the feed or touching `state/last_chapter.json`. Exit code is
-non-zero if any destination fails. If a role ping is expected but its
-variable is missing or invalid, the test refuses to send anything and
-exits non-zero, so it cannot pass with a silent no-ping. The same thing
-runs from GitHub Actions with the `send-test` dispatch mode (see below),
-which is the easiest way to test the real secrets.
+`--send-test` never fetches the feed and never writes state. It refuses to send if an expected role ping is misconfigured, so it cannot pass with a silent no-ping.
 
-**7. Run the unit tests:**
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-The suite is fully offline: it fakes the network layer and covers
-per-webhook delivery tracking, quarantine, retries, and the
-no-duplicate-messages behaviour.
-
-## Running manually on GitHub
-
-The workflow includes `workflow_dispatch`, so you can trigger it by hand:
-repo → Actions → "Check for new One Piece chapter" → Run workflow. The
-`mode` input chooses what runs:
-
-- `check` (default) — the normal check.
-- `dry-run` — fetch and print the latest chapter, send nothing.
-- `check-webhooks` — GET each configured webhook without sending a
-  message; reports OK or DEAD per secret, and fails if an expected role
-  ping variable is missing or invalid. Use this after rotating a webhook
-  URL, or when you suspect one is broken.
-- `send-test` — send a marked `[TEST]` alert (role ping included) to
-  every configured webhook. Sends nothing to state, so the next real
-  check still behaves normally.
-
-Good for confirming the scheduled workflow is wired up correctly before
-waiting for the next cron tick.
+`--force-state` **does** write state. If you use it locally, restore the real state before committing, or run the next check with your production webhook environment to let it advance normally. Do not use it on a shared production checkout just to “see” a notification.
 
 ## Schedule
 
-Cron times are UTC, roughly spread across the day (5 checks/day):
-`06:00`, `10:30`, `15:00`, `19:30`, `23:45` UTC.
-Edit the `on.schedule` block in `.github/workflows/check-chapter.yml` to
-change this.
+The workflow runs five checks per day, in UTC:
 
-## State file format
+| Cron | UTC |
+|---|---|
+| `0 6 * * *` | 06:00 |
+| `30 10 * * *` | 10:30 |
+| `0 15 * * *` | 15:00 |
+| `30 19 * * *` | 19:30 |
+| `45 23 * * *` | 23:45 |
 
-`state/last_chapter.json` is committed back to the repo whenever there is
-something to record, and drives the "already notified" logic:
+Edit the `on.schedule` block in `.github/workflows/check-chapter.yml` to change the times. GitHub’s scheduled runs can be delayed, especially at busy times; the schedule is a polling interval, not an exact delivery time. Each run still de-duplicates against the committed state.
+
+## State file
+
+`state/last_chapter.json` is committed by the workflow and drives the “already notified” logic:
 
 ```json
 {
@@ -248,23 +172,60 @@ something to record, and drives the "already notified" logic:
 }
 ```
 
-- `delivered_to` — env-var names of the webhooks that already received
-  this chapter. A webhook listed here is never notified about it again.
-- `quarantined` — webhooks that failed permanently, with the reason and a
-  truncated SHA-256 fingerprint of their URL (the URL itself is never
-  written to the repo). Replacing the secret changes the fingerprint,
-  which clears the entry and starts retrying that destination.
+- `delivered_to` — webhook env-var names that already received this chapter. A listed webhook is never notified about it again.
+- `quarantined` — permanently dead webhooks, keyed by env-var name, with a reason and a truncated URL fingerprint. The URL itself is never stored.
+- Older state files without these fields are read as “nothing delivered, nothing quarantined”.
 
-Old state files (without these fields) are read as "nothing delivered,
-nothing quarantined".
+## Tracking another series
+
+This version is deliberately scoped to One Piece. The feed URL and display text are constants in `scripts/check_chapter.py`:
+
+- `RSS_URL` and `SERIES_URL` — weebcentral’s series feed/page IDs
+- the `One Piece` labels in the embed, test payload, and forced-state title
+
+Changing those can adapt the same single-series pipeline to another weebcentral series with the same RSS shape. Running several series from one instance needs a different state model (one latest chapter per series, plus per-series delivery tracking) and is not implemented. The public website idea below is a larger redesign, not a flag flip.
+
+## Hosted website and multiple series
+
+A hosted website where people sign in and configure everything — instead of editing GitHub secrets and variables — is possible, but it is a different architecture from this repository:
+
+- accounts and authentication, so each person owns their configuration;
+- a database for users, series, subscriptions, and per-series delivery state;
+- encrypted-at-rest storage for Discord webhook URLs, with rotation and revocation;
+- a scheduler and worker/queue that poll each distinct series feed and fan out notifications;
+- per-series parsing and state (the current state file is a single series);
+- a decision on Discord setup: pasting a webhook URL is much simpler than building a Discord bot with OAuth and Manage Webhooks permissions.
+
+That version could support many series and many users, but it would no longer be “a GitHub Action with a JSON file.” This repository is the zero-server, single-series edition.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Workflow does not run on schedule | Forked repo, Actions disabled, or repo archived | Open **Actions** and enable workflows; check the cron block |
+| “No Discord webhook URLs configured” | No secret, or all webhooks quarantined | Add `DISCORD_WEBHOOK_URL`; run `--check-webhooks` |
+| Chapter delivered but role did not ping | Role ID missing/invalid, or role is not mentionable | Set `DISCORD_ROLE_ID_2`; allow the role to be mentioned |
+| Chapter delivered but run is red | Expected role ping was misconfigured | Fix the variable; the delivery itself succeeded |
+| No notification, no error | State already at the latest chapter | Check `state/last_chapter.json`; use `--force-state` only for testing |
+| “RSS feed returned HTTP 403/404” | Feed URL retired or blocked | Verify weebcentral’s feed link; update `RSS_URL` |
+| “Could not extract a chapter number” | Feed title format changed | Update `CHAPTER_NUM_RE` |
+| State file not committing | `contents: write` blocked | Check workflow permissions |
+| Duplicate notifications | State commit skipped after a failed delivery | Verify `continue-on-error: true` on the check step and `if: always()` on the commit step |
 
 ## Files
 
 ```
-scripts/check_chapter.py       # scraper + state diff + Discord notify
-state/last_chapter.json        # persisted "last seen" chapter + delivery tracking
-tests/test_check_chapter.py    # offline unit tests for the above
+scripts/check_chapter.py           # RSS fetch, state diff, Discord delivery
+state/last_chapter.json            # last-seen chapter + per-webhook delivery ledger
+tests/test_check_chapter.py        # offline unit tests
 .github/workflows/check-chapter.yml
-.gitignore
+docs/SHOWCASE.md                   # project write-up and graphics
 README.md
+LICENSE
 ```
+
+See [`docs/SHOWCASE.md`](docs/SHOWCASE.md) for a longer project overview, architecture graphics, and showcase copy.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
